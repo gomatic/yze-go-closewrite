@@ -7,6 +7,11 @@ import (
 
 const closeMethod = "Close"
 
+// importPath is a package's import path, e.g. "os". Resolution goes through the
+// type checker, so an aliased import is still recognized and a local variable
+// spelled os is not mistaken for the package.
+type importPath string
+
 // writeOpeners are the os functions whose result is a file the caller intends
 // to WRITE. os.Open is deliberately absent: a reader's unclosed error loses
 // nothing, and reporting it would bury the real findings under the single most
@@ -92,11 +97,11 @@ func hasWriteFlag(info *types.Info, args []ast.Expr) bool {
 // isPackage reports whether expr names the given imported package, resolved
 // through the type info rather than the identifier's spelling — an aliased
 // import must still be recognized, and a local variable called os must not be.
-func isPackage(info *types.Info, expr ast.Expr, want string) bool {
+func isPackage(info *types.Info, expr ast.Expr, want importPath) bool {
 	ident, ok := expr.(*ast.Ident)
 	if !ok {
 		return false
 	}
 	pkg, ok := info.ObjectOf(ident).(*types.PkgName)
-	return ok && pkg.Imported().Path() == want
+	return ok && importPath(pkg.Imported().Path()) == want
 }

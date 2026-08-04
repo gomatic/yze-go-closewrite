@@ -16,6 +16,23 @@ import (
 // whole fleet's gate depends on — a crash there fails every repository at
 // once. Driving them directly is the design being testable, not a workaround.
 
+// TestWriteOpenedCollectsOnlyFilesTheCallerMeansToWrite names writeOpened's
+// claim: the open itself is the evidence of write intent, so a reader's file
+// never enters the set and its Close is never reported.
+func TestWriteOpenedCollectsOnlyFilesTheCallerMeansToWrite(t *testing.T) {
+	t.Parallel()
+
+	assert.True(t, writeOpeners["Create"], "os.Create means to write")
+	assert.True(t, writeOpeners["CreateTemp"], "so does os.CreateTemp")
+	assert.False(t, writeOpeners["Open"], "os.Open is read-only and must never enter the set")
+	assert.False(t, writeOpeners["OpenFile"], "os.OpenFile qualifies only with a write flag")
+
+	assert.True(t, writeFlags["O_WRONLY"], "a write flag establishes intent")
+	assert.False(t, writeFlags["O_RDONLY"], "a read-only flag does not")
+
+	assert.Empty(t, writeOpened(&types.Info{}, &ast.BlockStmt{}), "an empty body opens nothing")
+}
+
 // TestBodyOfYieldsNilForAnythingButAFunction pins the type switch's default.
 func TestBodyOfYieldsNilForAnythingButAFunction(t *testing.T) {
 	t.Parallel()

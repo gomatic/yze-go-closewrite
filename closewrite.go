@@ -87,16 +87,44 @@ func reportBody(pass *analysis.Pass, body *ast.BlockStmt) {
 	}
 }
 
-// closedWithHandling names the files whose Close error is bound somewhere in
-// the body, so a second, deferred close of the same file is not a defect.
+// closedWithHandling names the files whose close is already accounted for
+// somewhere in the body, so a second, deferred close of the same file is not a
+// defect.
+//
+// Two shapes settle a file. The direct one is a Close call whose error is
+// bound. The other is the file being HANDED to a call whose error is bound —
+// which is what a seamed close looks like: `closeOutput(file)`, a package-level
+// function var standing in for f.Close() so a test can force the failure. That
+// indirection is the sanctioned way to reach this very branch, and an earlier
+// version of this analyzer reported both files whose closes had just been fixed
+// that way. A rule that flags the shape its own findings are repaired into is
+// worse than no rule.
 func closedWithHandling(info *types.Info, body *ast.BlockStmt) map[types.Object]bool {
 	settled := map[types.Object]bool{}
 	for _, call := range handledCloses(body) {
 		if name, ok := closedObject(info, call); ok {
 			settled[name] = true
 		}
+		for _, name := range argumentObjects(info, call) {
+			settled[name] = true
+		}
 	}
 	return settled
+}
+
+// argumentObjects names the variables passed directly as arguments to a call.
+func argumentObjects(info *types.Info, call *ast.CallExpr) []types.Object {
+	var passed []types.Object
+	for _, arg := range call.Args {
+		ident, ok := arg.(*ast.Ident)
+		if !ok {
+			continue
+		}
+		if object := info.ObjectOf(ident); object != nil {
+			passed = append(passed, object)
+		}
+	}
+	return passed
 }
 
 // closedObject resolves the variable a Close call was made on.

@@ -158,3 +158,22 @@ type closer struct{}
 
 // Close satisfies the shape without being a file.
 func (closer) Close() error { return nil }
+
+// closeVia is a seam standing in for f.Close(), the sanctioned way to make a
+// close failure reachable from a test.
+var closeVia = func(f *os.File) error { return f.Close() }
+
+// SeamedCloseIsSilent hands the file to a seam whose error is returned. This is
+// what a FIXED site looks like, and an earlier version of this rule reported it
+// — flagging the very shape its own findings are repaired into.
+func SeamedCloseIsSilent(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.WriteString("data"); err != nil {
+		return err
+	}
+	return closeVia(f)
+}
