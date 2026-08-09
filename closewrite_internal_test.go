@@ -85,21 +85,22 @@ func TestBlankAssignedRequiresOneCallAndAllBlankTargets(t *testing.T) {
 	assert.False(t, allBlank(nil), "an empty target list discards nothing")
 }
 
-// TestIsPackageRejectsNonIdentifiersAndNonPackages pins the resolution that
-// keeps an aliased import recognized and a local variable named os ignored.
-func TestIsPackageRejectsNonIdentifiersAndNonPackages(t *testing.T) {
+// TestIsOSPackageMustNotMatchALocalVariableNamedOS pins the invariant
+// isOSPackage documents: resolution goes through the type info, so an aliased
+// import is still recognized and a local variable spelled os is not.
+func TestIsOSPackageMustNotMatchALocalVariableNamedOS(t *testing.T) {
 	t.Parallel()
 
 	info := &types.Info{Uses: map[*ast.Ident]types.Object{}, Defs: map[*ast.Ident]types.Object{}}
 
-	assert.False(t, isPackage(info, &ast.SelectorExpr{}, "os"), "a non-identifier names no package")
+	assert.False(t, isOSPackage(info, &ast.SelectorExpr{}), "a non-identifier names no package")
 
 	local := ast.NewIdent("os")
 	info.Uses[local] = types.NewVar(token.NoPos, nil, "os", types.Typ[types.String])
-	assert.False(t, isPackage(info, local, "os"), "a variable named os is not package os")
+	assert.False(t, isOSPackage(info, local), "a variable named os is not package os")
 
 	unresolved := ast.NewIdent("os")
-	assert.False(t, isPackage(info, unresolved, "os"), "an unresolved identifier names no package")
+	assert.False(t, isOSPackage(info, unresolved), "an unresolved identifier names no package")
 }
 
 // TestClosedObjectRejectsAnythingButANamedReceiversClose pins the receiver

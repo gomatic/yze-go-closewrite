@@ -68,7 +68,7 @@ func collectOpened(info *types.Info, assign *ast.AssignStmt, opened map[types.Ob
 // opensForWrite reports whether call is an os open establishing write intent.
 func opensForWrite(info *types.Info, call *ast.CallExpr) bool {
 	selector, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || !isPackage(info, selector.X, "os") {
+	if !ok || !isOSPackage(info, selector.X) {
 		return false
 	}
 	if writeOpeners[selector.Sel.Name] {
@@ -85,7 +85,7 @@ func hasWriteFlag(info *types.Info, args []ast.Expr) bool {
 	for _, arg := range args {
 		ast.Inspect(arg, func(node ast.Node) bool {
 			selector, ok := node.(*ast.SelectorExpr)
-			if ok && isPackage(info, selector.X, "os") && writeFlags[selector.Sel.Name] {
+			if ok && isOSPackage(info, selector.X) && writeFlags[selector.Sel.Name] {
 				found = true
 			}
 			return !found
@@ -94,14 +94,20 @@ func hasWriteFlag(info *types.Info, args []ast.Expr) bool {
 	return found
 }
 
-// isPackage reports whether expr names the given imported package, resolved
+// osPath is the import path this analyzer resolves against. It is a constant
+// rather than a parameter because every call site passes it: the analyzer is
+// about os file opens specifically, so a package parameter was a generalization
+// nothing used, which is what unparam reported.
+const osPath importPath = "os"
+
+// isOSPackage reports whether expr names the imported os package, resolved
 // through the type info rather than the identifier's spelling — an aliased
 // import must still be recognized, and a local variable called os must not be.
-func isPackage(info *types.Info, expr ast.Expr, want importPath) bool {
+func isOSPackage(info *types.Info, expr ast.Expr) bool {
 	ident, ok := expr.(*ast.Ident)
 	if !ok {
 		return false
 	}
 	pkg, ok := info.ObjectOf(ident).(*types.PkgName)
-	return ok && importPath(pkg.Imported().Path()) == want
+	return ok && importPath(pkg.Imported().Path()) == osPath
 }
