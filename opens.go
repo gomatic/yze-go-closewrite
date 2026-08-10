@@ -3,6 +3,7 @@ package closewrite
 import (
 	"go/ast"
 	"go/constant"
+	"go/token"
 	"go/types"
 )
 
@@ -44,7 +45,7 @@ var writeFlags = map[string]bool{
 // literal's own visit.
 func writeOpened(info *types.Info, body *ast.BlockStmt) map[types.Object]bool {
 	opened := map[types.Object]bool{}
-	walkOwn(body, func(node ast.Node) {
+	walkOwn(body, func(node ast.Node, _ deferredness) {
 		switch at := node.(type) {
 		case *ast.AssignStmt:
 			collectOpened(info, body, at.Lhs, at.Rhs, opened)
@@ -95,7 +96,7 @@ func opensForWrite(info *types.Info, body *ast.BlockStmt, call *ast.CallExpr) bo
 	if writeOpeners[selector.Sel.Name] {
 		return true
 	}
-	return selector.Sel.Name == "OpenFile" && hasWriteFlag(info, body, osImported(info, selector.X), call.Args)
+	return selector.Sel.Name == "OpenFile" && hasWriteFlag(info, body, osImported(info, selector.X), call)
 }
 
 // osImported resolves the imported os package the selector's qualifier names.
@@ -109,11 +110,12 @@ func osImported(info *types.Info, expr ast.Expr) *types.Package {
 // hasWriteFlag reports whether any argument carries an os flag that implies
 // writing, in any spelling: a literal `os.O_*` selector, a constant expression
 // the checker folded (`const mode = os.O_WRONLY | os.O_CREATE`), or a local
-// variable whose assignments in this body carry either.
-func hasWriteFlag(info *types.Info, body *ast.BlockStmt, osPkg *types.Package, args []ast.Expr) bool {
+// variable whose assignments BEFORE the open carry either — what the variable
+// becomes after the open opened nothing.
+func hasWriteFlag(info *types.Info, body *ast.BlockStmt, osPkg *types.Package, call *ast.CallExpr) bool {
 	mask := writeFlagMask(osPkg)
-	for _, arg := range args {
-		if flagWrites(info, body, mask, arg) {
+	for _, arg := range call.Args {
+		if flagWrites(info, body, mask, arg, call.Pos()) {
 			return true
 		}
 	}
@@ -154,7 +156,7 @@ func flagValue(osPkg *types.Package, name flagName) flagMask {
 
 // flagWrites reports whether one flag expression implies writing, chasing a
 // local variable's assignments one level.
-func flagWrites(info *types.Info, body *ast.BlockStmt, mask flagMask, expr ast.Expr) bool {
+func flagWrites(info *types.Info, body *ast.BlockStmt, mask flagMask, expr ast.Expr, before token.Pos) bool {
 	if constWrites(info, mask, expr) || selectorWrites(info, expr) {
 		return true
 	}
@@ -162,7 +164,7 @@ func flagWrites(info *types.Info, body *ast.BlockStmt, mask flagMask, expr ast.E
 	if !ok {
 		return false
 	}
-	return assignedFlagWrites(info, body, mask, info.ObjectOf(ident))
+	return assignedFlagWrites(info, body, mask, info.ObjectOf(ident), before)
 }
 
 // constWrites reports a checker-folded constant expression carrying a write
@@ -192,13 +194,19 @@ func selectorWrites(info *types.Info, expr ast.Expr) bool {
 // assignedFlagWrites chases a local flag variable to the expressions assigned
 // to it anywhere in this body — `flags := os.O_WRONLY | os.O_CREATE` or a
 // later `flags |= os.O_APPEND` — and judges those.
-func assignedFlagWrites(info *types.Info, body *ast.BlockStmt, mask flagMask, object types.Object) bool {
+func assignedFlagWrites(
+	info *types.Info,
+	body *ast.BlockStmt,
+	mask flagMask,
+	object types.Object,
+	before token.Pos,
+) bool {
 	if object == nil {
 		return false
 	}
 	found := false
-	walkOwn(body, func(node ast.Node) {
-		if found {
+	walkOwn(body, func(node ast.Node, _ deferredness) {
+		if found || node.End() >= before {
 			return
 		}
 		switch at := node.(type) {

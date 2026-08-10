@@ -22,7 +22,7 @@ import "go/ast"
 // authors away from the very fix it is asking for.
 func discardedCloses(body *ast.BlockStmt) []*ast.CallExpr {
 	var discarded []*ast.CallExpr
-	walkOwn(body, func(node ast.Node) {
+	walkOwn(body, func(node ast.Node, _ deferredness) {
 		if deferred, ok := node.(*ast.DeferStmt); ok {
 			discarded = append(discarded, deferredDiscards(deferred)...)
 		}
@@ -42,12 +42,17 @@ func deferredDiscards(deferred *ast.DeferStmt) []*ast.CallExpr {
 		if call, ok := discardedIn(node); ok {
 			discarded = append(discarded, call)
 		}
+		if assign, ok := node.(*ast.AssignStmt); ok {
+			discarded = append(discarded, blankAssignedAll(assign)...)
+		}
 		return true
 	})
 	return discarded
 }
 
-// discardedIn yields the call a statement discards, if it discards one.
+// discardedIn yields the call a statement discards, if it discards one. A
+// return statement discards here too: these statements live inside a DEFERRED
+// closure, whose return value the defer runtime throws away.
 func discardedIn(node ast.Node) (*ast.CallExpr, bool) {
 	switch stmt := node.(type) {
 	case *ast.ExprStmt:
@@ -55,8 +60,20 @@ func discardedIn(node ast.Node) (*ast.CallExpr, bool) {
 		return call, ok
 	case *ast.AssignStmt:
 		return blankAssigned(stmt)
+	case *ast.ReturnStmt:
+		return returnedCall(stmt)
 	}
 	return nil, false
+}
+
+// returnedCall yields a return statement's single call result, if that is
+// what it returns.
+func returnedCall(stmt *ast.ReturnStmt) (*ast.CallExpr, bool) {
+	if len(stmt.Results) != 1 {
+		return nil, false
+	}
+	call, ok := stmt.Results[0].(*ast.CallExpr)
+	return call, ok
 }
 
 // boundCalls collects the calls in body whose result IS bound — assigned to at
@@ -73,20 +90,33 @@ func discardedIn(node ast.Node) (*ast.CallExpr, bool) {
 // nothing; only a bound result can carry the close error somewhere.
 func boundCalls(body *ast.BlockStmt) []*ast.CallExpr {
 	var bound []*ast.CallExpr
-	walkOwn(body, func(node ast.Node) {
-		switch stmt := node.(type) {
-		case *ast.AssignStmt:
-			if !allBlank(stmt.Lhs) {
-				bound = append(bound, callsUnder(stmt.Rhs...)...)
-			}
-		case *ast.ReturnStmt:
-			bound = append(bound, callsUnder(stmt.Results...)...)
-		}
+	walkOwn(body, func(node ast.Node, isDeferred deferredness) {
+		bound = append(bound, boundIn(node, isDeferred)...)
 	})
 	return bound
 }
 
-// blankAssigned yields the call of an assignment that throws every result away.
+// boundIn yields the calls one statement binds: a non-blank assignment's
+// right-hand calls, and a return's results — unless the return sits in
+// deferred flow, where the runtime discards the value and it binds nothing.
+func boundIn(node ast.Node, isDeferred deferredness) []*ast.CallExpr {
+	switch stmt := node.(type) {
+	case *ast.AssignStmt:
+		if !allBlank(stmt.Lhs) {
+			return callsUnder(stmt.Rhs...)
+		}
+	case *ast.ReturnStmt:
+		if isDeferred == ownFlow {
+			return callsUnder(stmt.Results...)
+		}
+	}
+	return nil
+}
+
+// blankAssigned yields the call of an assignment that throws every result
+// away — the single-call form; the tuple form `_, _ = f.Close(), g.Close()`
+// discards each call on its right-hand side and is collected whole by
+// blankAssignedAll.
 func blankAssigned(assign *ast.AssignStmt) (*ast.CallExpr, bool) {
 	if len(assign.Rhs) != 1 {
 		return nil, false
@@ -96,6 +126,20 @@ func blankAssigned(assign *ast.AssignStmt) (*ast.CallExpr, bool) {
 		return nil, false
 	}
 	return call, true
+}
+
+// blankAssignedAll yields every call an all-blank tuple assignment discards.
+func blankAssignedAll(assign *ast.AssignStmt) []*ast.CallExpr {
+	if !allBlank(assign.Lhs) || len(assign.Rhs) < 2 {
+		return nil
+	}
+	var discarded []*ast.CallExpr
+	for _, rhs := range assign.Rhs {
+		if call, ok := rhs.(*ast.CallExpr); ok {
+			discarded = append(discarded, call)
+		}
+	}
+	return discarded
 }
 
 // allBlank reports whether every target is the blank identifier.

@@ -45,15 +45,41 @@ var Registration = goyze.Registration{
 	Analyzer:   Analyzer,
 }
 
-// run reports every discarded Close on a write-opened file.
+// run reports every discarded Close on a write-opened file. A DEFERRED
+// function literal is skipped here: it runs as part of its enclosing
+// function's exit, so the enclosing function's own walk carries it — visiting
+// it again would report its findings twice.
 func run(pass *analysis.Pass) (any, error) {
 	insp := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
-	insp.Preorder([]ast.Node{(*ast.FuncDecl)(nil), (*ast.FuncLit)(nil)}, func(node ast.Node) {
-		if body := bodyOf(node); body != nil {
-			reportBody(pass, body)
-		}
-	})
+	insp.WithStack(
+		[]ast.Node{(*ast.FuncDecl)(nil), (*ast.FuncLit)(nil)},
+		func(node ast.Node, isPush bool, stack []ast.Node) bool {
+			if !isPush || isDeferredLiteral(node, stack) {
+				return true
+			}
+			if body := bodyOf(node); body != nil {
+				reportBody(pass, body)
+			}
+			return true
+		},
+	)
 	return nil, nil
+}
+
+// isDeferredLiteral reports a function literal that is the deferred call of a
+// defer statement — `defer func() { … }()` — whose body belongs to the
+// enclosing function's flow.
+func isDeferredLiteral(node ast.Node, stack []ast.Node) bool {
+	lit, ok := node.(*ast.FuncLit)
+	if !ok || len(stack) < 3 {
+		return false
+	}
+	call, ok := stack[len(stack)-2].(*ast.CallExpr)
+	if !ok || call.Fun != lit {
+		return false
+	}
+	deferred, ok := stack[len(stack)-3].(*ast.DeferStmt)
+	return ok && deferred.Call == call
 }
 
 // bodyOf yields a function's body, whichever form declared it.
@@ -140,9 +166,12 @@ func resultsIncludeError(info *types.Info, call *ast.CallExpr) bool {
 	return isErrorType(at)
 }
 
-// isErrorType reports the universe error type.
+// isErrorType reports a type that carries an error: the universe error itself
+// or any type implementing it, since a seam returning *os.PathError carries
+// the close error as surely as one returning error.
 func isErrorType(at types.Type) bool {
-	return types.Identical(at, types.Universe.Lookup("error").Type())
+	errType := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
+	return types.Implements(at, errType) || types.Implements(types.NewPointer(at), errType)
 }
 
 // argumentObjects names the variables passed directly as arguments to a call.

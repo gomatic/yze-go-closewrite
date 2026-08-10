@@ -128,3 +128,23 @@ func ComputedMode(path string, extra int) error {
 	_, err = f.WriteString("data")
 	return err
 }
+
+// ReassignedAfterOpen pins the flow rule: what the flag variable becomes AFTER
+// the open opened nothing. The reader below was opened read-only and stays
+// silent although the same variable later carries a write flag.
+func ReassignedAfterOpen(p, q string) error {
+	flags := os.O_RDONLY
+	r, err := os.OpenFile(p, flags, 0)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	flags = os.O_WRONLY
+	w, err := os.OpenFile(q, flags, 0o644)
+	if err != nil {
+		return err
+	}
+	defer w.Close() // want `the Close error on w is discarded`
+	_, err = w.WriteString("data")
+	return err
+}

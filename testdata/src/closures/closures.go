@@ -33,3 +33,17 @@ func Outer(path string) error {
 	}
 	return f.Close()
 }
+
+// DeferredWorkspace opens, writes, and discards entirely inside a DEFERRED
+// closure: the enclosing function's walk owns that flow, and the finding is
+// reported exactly once — an extra diagnostic fails this fixture.
+func DeferredWorkspace(path string) {
+	defer func() {
+		f, err := os.Create(path)
+		if err != nil {
+			return
+		}
+		defer f.Close() // want `the Close error on f is discarded`
+		_, _ = f.WriteString("state")
+	}()
+}

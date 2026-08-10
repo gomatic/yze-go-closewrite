@@ -203,5 +203,5 @@ func TestAssignedFlagWritesRefusesANilObject(t *testing.T) {
 	t.Parallel()
 
 	info := &types.Info{}
-	assert.False(t, assignedFlagWrites(info, &ast.BlockStmt{}, flagMask(1), nil))
+	assert.False(t, assignedFlagWrites(info, &ast.BlockStmt{}, flagMask(1), nil, token.NoPos))
 }
