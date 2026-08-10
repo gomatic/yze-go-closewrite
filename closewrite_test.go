@@ -38,3 +38,34 @@ func TestRegistrationIsWellFormed(t *testing.T) {
 	assert.Equal(t, "yze/closewrite", closewrite.Registration.RuleID())
 	assert.Same(t, closewrite.Analyzer, closewrite.Registration.Analyzer)
 }
+
+// TestOnlyABoundCallSettlesAFile pins the binding rule the settlement rests
+// on, in both directions: writing through fmt, handing the file to a
+// result-less call, wrapping it in bufio, discarding the close twice, and the
+// var-declaration open all still report — while the safety-net pair, the
+// return-bound close, the errors.Join'd close, the seamed close, and the
+// documented bound-write heuristic stay silent.
+func TestOnlyABoundCallSettlesAFile(t *testing.T) {
+	t.Parallel()
+
+	analysistest.Run(t, analysistest.TestData(), closewrite.Analyzer, "bound")
+}
+
+// TestEveryWriteFlagSpellingIsRecognised pins flag resolution beyond the
+// literal selector: a folded named constant, a local flag variable, and each
+// write flag alone — O_WRONLY, O_RDWR, O_APPEND, O_TRUNC, and the documented
+// O_CREATE decision — while the read-only open stays silent.
+func TestEveryWriteFlagSpellingIsRecognised(t *testing.T) {
+	t.Parallel()
+
+	analysistest.Run(t, analysistest.TestData(), closewrite.Analyzer, "flags")
+}
+
+// TestAClosureIsItsOwnFunction pins the one-visit-per-function property: an
+// open-and-discard inside a literal is the literal's finding exactly once —
+// analysistest fails on an extra diagnostic, so a double report cannot pass.
+func TestAClosureIsItsOwnFunction(t *testing.T) {
+	t.Parallel()
+
+	analysistest.Run(t, analysistest.TestData(), closewrite.Analyzer, "closures")
+}

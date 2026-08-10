@@ -2,8 +2,10 @@ package closewrite
 
 import (
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -137,11 +139,69 @@ func TestCollectOpenedIgnoresAssignmentsThatCannotBeAFileOpen(t *testing.T) {
 	info := &types.Info{Uses: map[*ast.Ident]types.Object{}, Defs: map[*ast.Ident]types.Object{}}
 	opened := map[types.Object]bool{}
 
-	collectOpened(info, &ast.AssignStmt{}, opened)
-	collectOpened(info, &ast.AssignStmt{
-		Lhs: []ast.Expr{ast.NewIdent("f")},
-		Rhs: []ast.Expr{ast.NewIdent("x")},
-	}, opened)
+	body := &ast.BlockStmt{}
+	collectOpened(info, body, nil, nil, opened)
+	collectOpened(info, body,
+		[]ast.Expr{ast.NewIdent("f")},
+		[]ast.Expr{ast.NewIdent("x")},
+		opened)
 
-	assert.Empty(t, opened, "neither an empty assignment nor a non-call right-hand side opens a file")
+	assert.Empty(t, opened, "neither an empty binding nor a non-call right-hand side opens a file")
+}
+
+// TestFlagValueYieldsZeroWithoutAnExactIntConstant pins the two refusals that
+// keep the mask honest: a name the package does not declare as a constant
+// contributes nothing, and an integer too large for int64 contributes nothing
+// rather than a truncated bit pattern.
+func TestFlagValueYieldsZeroWithoutAnExactIntConstant(t *testing.T) {
+	t.Parallel()
+
+	pkg := types.NewPackage("os", "os")
+	assert.Zero(t, flagValue(pkg, "O_NOT_DECLARED"), "an absent constant contributes nothing")
+
+	huge := types.NewConst(0, pkg, "O_HUGE", types.Typ[types.UntypedInt], constant.MakeUint64(math.MaxUint64))
+	pkg.Scope().Insert(huge)
+	assert.Zero(t, flagValue(pkg, "O_HUGE"), "an inexact value contributes nothing rather than truncating")
+
+	exact := types.NewConst(0, pkg, "O_REAL", types.Typ[types.UntypedInt], constant.MakeInt64(4))
+	pkg.Scope().Insert(exact)
+	assert.Equal(t, flagMask(4), flagValue(pkg, "O_REAL"))
+}
+
+// TestResultsIncludeErrorJudgesEveryResultShape pins the settlement guard: a
+// call with no recorded type proves nothing, a tuple settles only when one of
+// its members is the error type, and a single result settles only when it IS
+// the error type.
+func TestResultsIncludeErrorJudgesEveryResultShape(t *testing.T) {
+	t.Parallel()
+
+	errType := types.Universe.Lookup("error").Type()
+	intType := types.Typ[types.Int]
+	pair := func(at types.Type) *ast.CallExpr {
+		call := &ast.CallExpr{Fun: ast.NewIdent("f")}
+		info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{call: {Type: at}}}
+		if !resultsIncludeError(info, call) {
+			return call
+		}
+		return nil
+	}
+
+	assert.NotNil(t, pair(nil), "no recorded type proves nothing")
+	assert.NotNil(t, pair(intType), "a lone non-error result proves nothing")
+	assert.Nil(t, pair(errType), "a lone error result settles")
+	assert.NotNil(t, pair(types.NewTuple(
+		types.NewVar(0, nil, "", intType), types.NewVar(0, nil, "", intType))),
+		"a tuple without an error proves nothing")
+	assert.Nil(t, pair(types.NewTuple(
+		types.NewVar(0, nil, "", intType), types.NewVar(0, nil, "", errType))),
+		"a tuple carrying an error settles")
+}
+
+// TestAssignedFlagWritesRefusesANilObject pins the chase's guard: an ident
+// the checker never resolved chases nothing.
+func TestAssignedFlagWritesRefusesANilObject(t *testing.T) {
+	t.Parallel()
+
+	info := &types.Info{}
+	assert.False(t, assignedFlagWrites(info, &ast.BlockStmt{}, flagMask(1), nil))
 }

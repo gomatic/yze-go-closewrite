@@ -91,25 +91,58 @@ func reportBody(pass *analysis.Pass, body *ast.BlockStmt) {
 // somewhere in the body, so a second, deferred close of the same file is not a
 // defect.
 //
-// Two shapes settle a file. The direct one is a Close call whose error is
-// bound. The other is the file being HANDED to a call whose error is bound —
-// which is what a seamed close looks like: `closeOutput(file)`, a package-level
-// function var standing in for f.Close() so a test can force the failure. That
-// indirection is the sanctioned way to reach this very branch, and an earlier
-// version of this analyzer reported both files whose closes had just been fixed
-// that way. A rule that flags the shape its own findings are repaired into is
-// worse than no rule.
+// Two shapes settle a file, and both require the call's result to be BOUND.
+// The direct one is a Close call whose error is assigned or returned. The
+// other is the file being HANDED to a bound call — which is what a seamed
+// close looks like: `return closeOutput(file)`, a package-level function var
+// standing in for f.Close() so a test can force the failure. That indirection
+// is the sanctioned way to reach this very branch, and an earlier version of
+// this analyzer reported both files whose closes had just been fixed that way.
+//
+// The bound-argument half is a documented heuristic with a known silence: a
+// bound WRITE taking the file — `if _, err := fmt.Fprintln(f, s); err != nil` —
+// also settles it, though a checked write is not a handled close. The trade is
+// deliberate and fixtured (see boundwrite in the testdata): erring toward
+// silence on a shape that demonstrably checks its errors costs less than
+// flagging the seamed-close repair this rule itself asks for.
 func closedWithHandling(info *types.Info, body *ast.BlockStmt) map[types.Object]bool {
 	settled := map[types.Object]bool{}
-	for _, call := range handledCloses(body) {
+	for _, call := range boundCalls(body) {
 		if name, ok := closedObject(info, call); ok {
 			settled[name] = true
+		}
+		if !resultsIncludeError(info, call) {
+			continue
 		}
 		for _, name := range argumentObjects(info, call) {
 			settled[name] = true
 		}
 	}
 	return settled
+}
+
+// resultsIncludeError reports whether the call produces an error among its
+// results — the only kind of bound result that could be carrying a close
+// error. A bound `bufio.NewWriter(f)` binds a writer and proves nothing.
+func resultsIncludeError(info *types.Info, call *ast.CallExpr) bool {
+	at := info.TypeOf(call)
+	if at == nil {
+		return false
+	}
+	if tuple, ok := at.(*types.Tuple); ok {
+		for i := range tuple.Len() {
+			if isErrorType(tuple.At(i).Type()) {
+				return true
+			}
+		}
+		return false
+	}
+	return isErrorType(at)
+}
+
+// isErrorType reports the universe error type.
+func isErrorType(at types.Type) bool {
+	return types.Identical(at, types.Universe.Lookup("error").Type())
 }
 
 // argumentObjects names the variables passed directly as arguments to a call.

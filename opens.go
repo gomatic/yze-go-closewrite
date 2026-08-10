@@ -2,6 +2,7 @@ package closewrite
 
 import (
 	"go/ast"
+	"go/constant"
 	"go/types"
 )
 
@@ -22,7 +23,11 @@ var writeOpeners = map[string]bool{
 	"OpenFile":   false, // conditional: only with a write flag, see opensForWrite
 }
 
-// writeFlags are the os open flags that establish an intent to write.
+// writeFlags are the os open flags that establish an intent to write. O_CREATE
+// is here deliberately even though it can accompany O_RDONLY: creating a file
+// and discarding its Close error still reports success over an entry that may
+// not have reached the directory, and the createonly fixture pins that
+// reading.
 var writeFlags = map[string]bool{
 	"O_WRONLY": true,
 	"O_RDWR":   true,
@@ -33,30 +38,46 @@ var writeFlags = map[string]bool{
 
 // writeOpened collects the variables in body assigned from a write-opening
 // call, keyed by the object so shadowing in a nested scope cannot be confused
-// with the outer file.
+// with the outer file. Both binding forms count — `f, err := os.Create(p)`
+// and `var f, err = os.Create(p)` open the same file — and the walk stays
+// within this function's own flow, so a literal's opens belong to the
+// literal's own visit.
 func writeOpened(info *types.Info, body *ast.BlockStmt) map[types.Object]bool {
 	opened := map[types.Object]bool{}
-	ast.Inspect(body, func(node ast.Node) bool {
-		assign, ok := node.(*ast.AssignStmt)
-		if ok {
-			collectOpened(info, assign, opened)
+	walkOwn(body, func(node ast.Node) {
+		switch at := node.(type) {
+		case *ast.AssignStmt:
+			collectOpened(info, body, at.Lhs, at.Rhs, opened)
+		case *ast.ValueSpec:
+			collectOpenedSpec(info, body, at, opened)
 		}
-		return true
 	})
 	return opened
 }
 
-// collectOpened records the assignment's first name when its right-hand side
+// collectOpenedSpec records a var declaration's first name when its value
 // opens a file for writing.
-func collectOpened(info *types.Info, assign *ast.AssignStmt, opened map[types.Object]bool) {
-	if len(assign.Rhs) != 1 || len(assign.Lhs) == 0 {
+func collectOpenedSpec(info *types.Info, body *ast.BlockStmt, spec *ast.ValueSpec, opened map[types.Object]bool) {
+	values := make([]ast.Expr, len(spec.Values))
+	copy(values, spec.Values)
+	names := make([]ast.Expr, len(spec.Names))
+	for i, name := range spec.Names {
+		names[i] = name
+	}
+	collectOpened(info, body, names, values, opened)
+}
+
+// collectOpened records the binding's first name when its right-hand side
+// opens a file for writing.
+func collectOpened(info *types.Info, body *ast.BlockStmt, lhs, rhs []ast.Expr, opened map[types.Object]bool) {
+	if len(rhs) != 1 || len(lhs) == 0 {
 		return
 	}
-	call, ok := assign.Rhs[0].(*ast.CallExpr)
-	if !ok || !opensForWrite(info, call) {
+	call, ok := rhs[0].(*ast.CallExpr)
+	if !ok || !opensForWrite(info, body, call) {
 		return
 	}
-	name, ok := assign.Lhs[0].(*ast.Ident)
+	name, ok := lhs[0].(*ast.Ident)
 	if !ok {
 		return
 	}
@@ -66,7 +87,7 @@ func collectOpened(info *types.Info, assign *ast.AssignStmt, opened map[types.Ob
 }
 
 // opensForWrite reports whether call is an os open establishing write intent.
-func opensForWrite(info *types.Info, call *ast.CallExpr) bool {
+func opensForWrite(info *types.Info, body *ast.BlockStmt, call *ast.CallExpr) bool {
 	selector, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || !isOSPackage(info, selector.X) {
 		return false
@@ -74,24 +95,149 @@ func opensForWrite(info *types.Info, call *ast.CallExpr) bool {
 	if writeOpeners[selector.Sel.Name] {
 		return true
 	}
-	return selector.Sel.Name == "OpenFile" && hasWriteFlag(info, call.Args)
+	return selector.Sel.Name == "OpenFile" && hasWriteFlag(info, body, osImported(info, selector.X), call.Args)
 }
 
-// hasWriteFlag reports whether any argument mentions an os flag that implies
-// writing. The flags arrive as an OR of constants, so the whole argument list
-// is scanned rather than a single position parsed.
-func hasWriteFlag(info *types.Info, args []ast.Expr) bool {
-	found := false
+// osImported resolves the imported os package the selector's qualifier names.
+// opensForWrite has already established the qualifier IS the os package, so
+// the lookups are exact by construction.
+func osImported(info *types.Info, expr ast.Expr) *types.Package {
+	ident := expr.(*ast.Ident)
+	return info.ObjectOf(ident).(*types.PkgName).Imported()
+}
+
+// hasWriteFlag reports whether any argument carries an os flag that implies
+// writing, in any spelling: a literal `os.O_*` selector, a constant expression
+// the checker folded (`const mode = os.O_WRONLY | os.O_CREATE`), or a local
+// variable whose assignments in this body carry either.
+func hasWriteFlag(info *types.Info, body *ast.BlockStmt, osPkg *types.Package, args []ast.Expr) bool {
+	mask := writeFlagMask(osPkg)
 	for _, arg := range args {
-		ast.Inspect(arg, func(node ast.Node) bool {
-			selector, ok := node.(*ast.SelectorExpr)
-			if ok && isOSPackage(info, selector.X) && writeFlags[selector.Sel.Name] {
-				found = true
-			}
-			return !found
-		})
+		if flagWrites(info, body, mask, arg) {
+			return true
+		}
 	}
+	return false
+}
+
+// flagMask is the OR of write-implying open-flag values.
+type flagMask int64
+
+// writeFlagMask is the OR of the os package's write-implying flag values,
+// read from the type-checked os package itself rather than hardcoding any
+// platform's numbers.
+func writeFlagMask(osPkg *types.Package) flagMask {
+	var mask flagMask
+	for name, implies := range writeFlags {
+		if implies {
+			mask |= flagValue(osPkg, flagName(name))
+		}
+	}
+	return mask
+}
+
+// flagName is the spelled name of an os open-flag constant.
+type flagName string
+
+// flagValue is one named os constant's folded value, zero when absent.
+func flagValue(osPkg *types.Package, name flagName) flagMask {
+	c, ok := osPkg.Scope().Lookup(string(name)).(*types.Const)
+	if !ok {
+		return 0
+	}
+	v, exact := constant.Int64Val(c.Val())
+	if !exact {
+		return 0
+	}
+	return flagMask(v)
+}
+
+// flagWrites reports whether one flag expression implies writing, chasing a
+// local variable's assignments one level.
+func flagWrites(info *types.Info, body *ast.BlockStmt, mask flagMask, expr ast.Expr) bool {
+	if constWrites(info, mask, expr) || selectorWrites(info, expr) {
+		return true
+	}
+	ident, ok := ast.Unparen(expr).(*ast.Ident)
+	if !ok {
+		return false
+	}
+	return assignedFlagWrites(info, body, mask, info.ObjectOf(ident))
+}
+
+// constWrites reports a checker-folded constant expression carrying a write
+// bit.
+func constWrites(info *types.Info, mask flagMask, expr ast.Expr) bool {
+	value := info.Types[expr].Value
+	if value == nil {
+		return false
+	}
+	v, exact := constant.Int64Val(constant.ToInt(value))
+	return exact && flagMask(v)&mask != 0
+}
+
+// selectorWrites reports a literal os.O_* mention anywhere beneath expr.
+func selectorWrites(info *types.Info, expr ast.Expr) bool {
+	found := false
+	ast.Inspect(expr, func(node ast.Node) bool {
+		selector, ok := node.(*ast.SelectorExpr)
+		if ok && isOSPackage(info, selector.X) && writeFlags[selector.Sel.Name] {
+			found = true
+		}
+		return !found
+	})
 	return found
+}
+
+// assignedFlagWrites chases a local flag variable to the expressions assigned
+// to it anywhere in this body — `flags := os.O_WRONLY | os.O_CREATE` or a
+// later `flags |= os.O_APPEND` — and judges those.
+func assignedFlagWrites(info *types.Info, body *ast.BlockStmt, mask flagMask, object types.Object) bool {
+	if object == nil {
+		return false
+	}
+	found := false
+	walkOwn(body, func(node ast.Node) {
+		if found {
+			return
+		}
+		switch at := node.(type) {
+		case *ast.AssignStmt:
+			found = assignsFlagTo(info, mask, object, at.Lhs, at.Rhs)
+		case *ast.ValueSpec:
+			found = specAssignsFlagTo(info, mask, object, at)
+		}
+	})
+	return found
+}
+
+// assignsFlagTo reports an assignment binding a write-implying expression to
+// the object.
+func assignsFlagTo(info *types.Info, mask flagMask, object types.Object, lhs, rhs []ast.Expr) bool {
+	for i, target := range lhs {
+		ident, ok := target.(*ast.Ident)
+		if !ok || info.ObjectOf(ident) != object || i >= len(rhs) {
+			continue
+		}
+		if constWrites(info, mask, rhs[i]) || selectorWrites(info, rhs[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// specAssignsFlagTo reports a var declaration binding a write-implying
+// expression to the object.
+func specAssignsFlagTo(info *types.Info, mask flagMask, object types.Object, spec *ast.ValueSpec) bool {
+	for i, name := range spec.Names {
+		if info.ObjectOf(name) != object || i >= len(spec.Values) {
+			continue
+		}
+		if constWrites(info, mask, spec.Values[i]) || selectorWrites(info, spec.Values[i]) {
+			return true
+		}
+	}
+	return false
 }
 
 // osPath is the import path this analyzer resolves against. It is a constant

@@ -22,12 +22,10 @@ import "go/ast"
 // authors away from the very fix it is asking for.
 func discardedCloses(body *ast.BlockStmt) []*ast.CallExpr {
 	var discarded []*ast.CallExpr
-	ast.Inspect(body, func(node ast.Node) bool {
-		deferred, ok := node.(*ast.DeferStmt)
-		if ok {
+	walkOwn(body, func(node ast.Node) {
+		if deferred, ok := node.(*ast.DeferStmt); ok {
 			discarded = append(discarded, deferredDiscards(deferred)...)
 		}
-		return true
 	})
 	return discarded
 }
@@ -61,27 +59,31 @@ func discardedIn(node ast.Node) (*ast.CallExpr, bool) {
 	return nil, false
 }
 
-// handledCloses collects the Close calls in body whose error IS bound — the
-// evidence that the author already handles this file's close somewhere.
+// boundCalls collects the calls in body whose result IS bound — assigned to at
+// least one non-blank name, or returned to the caller — nested calls included,
+// so `return errors.Join(err, f.Close())` carries the Close.
 //
-// The safety-net idiom pairs them: `defer func() { _ = f.Close() }()` guards
-// the early returns while the success path ends in `return f.Close()`. The
-// deferred close is then a second close whose error is rightly ignored, and
-// flagging it would be asking the author to handle an error they already
-// handled a line below.
-func handledCloses(body *ast.BlockStmt) []*ast.CallExpr {
-	discarded := map[*ast.CallExpr]bool{}
-	for _, call := range discardedCloses(body) {
-		discarded[call] = true
-	}
-	var handled []*ast.CallExpr
-	ast.Inspect(body, func(node ast.Node) bool {
-		if call, ok := node.(*ast.CallExpr); ok && !discarded[call] {
-			handled = append(handled, call)
+// Binding is the whole test. An earlier revision collected every call that was
+// not itself a deferred discard, and the hole swallowed the rule: writing
+// through `fmt.Fprintln(f, …)`, wrapping with `bufio.NewWriter(f)`, or even
+// passing the file to a function that returns nothing all counted as
+// "handling", and the analyzer's own canonical target — a routine
+// `defer f.Close()` over a written file — went unreported whenever the write
+// was spelled as a call taking the file. A call that binds nothing proves
+// nothing; only a bound result can carry the close error somewhere.
+func boundCalls(body *ast.BlockStmt) []*ast.CallExpr {
+	var bound []*ast.CallExpr
+	walkOwn(body, func(node ast.Node) {
+		switch stmt := node.(type) {
+		case *ast.AssignStmt:
+			if !allBlank(stmt.Lhs) {
+				bound = append(bound, callsUnder(stmt.Rhs...)...)
+			}
+		case *ast.ReturnStmt:
+			bound = append(bound, callsUnder(stmt.Results...)...)
 		}
-		return true
 	})
-	return handled
+	return bound
 }
 
 // blankAssigned yields the call of an assignment that throws every result away.
