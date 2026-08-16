@@ -136,9 +136,8 @@ func BoundWrite(path, data string) error {
 }
 
 // CopiedInto is the analyzer's canonical target written the commonest way there
-// is. io.Copy takes the file and returns an error, and settles nothing: it is a
-// write, and a second argument means it was never closing on this function's
-// behalf.
+// is. io.Copy takes the file and hands back a COUNT beside its error, which is
+// what separates a write from a close: a close has nothing to count.
 func CopiedInto(path string, src io.Reader) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -154,36 +153,74 @@ func CopiedInto(path string, src io.Reader) error {
 // describe takes the file and reports something that is not its close.
 func describe(f *os.File) (string, error) { return f.Name(), nil }
 
-// transfer takes the file FIRST and something else second, and returns an
-// error: the shape a seam test keyed on the argument's position would accept.
+// transfer takes the file and something else, and hands back nothing but an
+// error: the shape a seam test keyed on the argument's position would refuse.
 func transfer(dst *os.File, src io.Reader) error { _, err := io.Copy(dst, src); return err }
 
-// TwoArgumentCallIsNotASeam deviates from SeamedClose in exactly one place: the
-// bound error-returning call takes a second argument. It was never closing on
-// this function's behalf.
-func TwoArgumentCallIsNotASeam(path string, src io.Reader) error {
+// SecondArgumentStillSettles deviates from SeamedClose in one place: the bound
+// error-returning call takes a second argument. That changes nothing about what
+// it hands back, and a close helper taking a logger or a context is ordinary —
+// an earlier revision required the file to be the only argument and reported
+// this, which is a finding no author can act on.
+func SecondArgumentStillSettles(path string, src io.Reader) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close() // want `the Close error on f is discarded`
+	defer f.Close()
+	if _, err := f.WriteString("data"); err != nil {
+		return err
+	}
 	return transfer(f, src)
 }
 
-// OneCallCannotSettleTwoFiles hands two created files to a single
-// error-returning call that closes neither of them.
-func OneCallCannotSettleTwoFiles(p, q string) error {
+// OneCallSettlesEveryFileHandedToIt pins the declared limit of the seam rule:
+// no signature separates a helper that closes both files from one that closes
+// neither, so both are settled and this is silent.
+func OneCallSettlesEveryFileHandedToIt(p, q string) error {
 	f, err := os.Create(p)
 	if err != nil {
 		return err
 	}
-	defer f.Close() // want `the Close error on f is discarded`
-	g, err := os.Open(q)
+	defer f.Close()
+	g, err := os.Create(q)
 	if err != nil {
 		return err
 	}
 	defer g.Close()
-	return transfer(f, g)
+	return closeBoth(f, g)
+}
+
+// closeBoth takes two files and hands back nothing but an error.
+func closeBoth(a, b *os.File) error { return errors.Join(a.Close(), b.Close()) }
+
+// OneArgumentWriteSettlesToo is the seam rule's declared hole, fixtured rather
+// than hidden: a bound write taking the file as its only argument and returning
+// nothing but an error is indistinguishable from a close, so it settles.
+func OneArgumentWriteSettlesToo(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return writeAll(f)
+}
+
+// writeAll writes and hands back nothing but an error, closing nothing.
+func writeAll(f *os.File) error { _, err := f.WriteString("data"); return err }
+
+// ParenthesisedSeamArgumentStillSettles wraps the handed-over file in
+// parentheses, which the seam unwraps before resolving the name.
+func ParenthesisedSeamArgumentStillSettles(path, data string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.WriteString(data); err != nil {
+		return err
+	}
+	return closeOutput((f))
 }
 
 // TupleResultSeam pins the second half of the seam shape: one argument, but a

@@ -2,7 +2,9 @@ package closewrite
 
 import (
 	"go/ast"
+	"go/parser"
 	"go/token"
+	"go/types"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -88,50 +90,132 @@ func probe() error {
 	assert.True(t, positions[all[5].Pos()], "a return in the function's own flow binds its result")
 }
 
-// TestOnSuccessPathDropsWhatAFailingBranchAlreadyHandles names the invariant
-// onSuccessPath documents: a discard is dropped exactly when it sits in a
-// region reached with a failure already in hand, and where that region is makes
-// no difference. Inside a deferred closure the guarded body is the rollback
-// idiom — the closure runs on every path, its `if err != nil` body does not —
-// and treating the closure as having no failing branch reported that idiom as a
-// defect against the standard library.
-func TestOnSuccessPathDropsWhatAFailingBranchAlreadyHandles(t *testing.T) {
+// TestDiscardedClosesJudgesOnlyAnUnconditionalDiscard names the invariant
+// discardedCloses documents: a discard reached only through a branch, a loop or
+// a label is not judged at all, wherever that branch is. Deciding which branch
+// is the already-failing one cannot be done from the syntax — an earlier
+// revision tried, reported the same cleanup written five other ways, and made
+// the exemption forgeable with `if <some non-nil error> != nil { … }`.
+//
+// A `defer` statement is the exception, and deliberately: deferring IS the
+// unconditional act, so `if x { defer f.Close() }` stays judged and cannot
+// become a two-line silence.
+func TestDiscardedClosesJudgesOnlyAnUnconditionalDiscard(t *testing.T) {
 	t.Parallel()
 
-	info, body := typedBody(t, `package probe
+	_, body := typedBody(t, `package probe
 
-func droppedInline() error   { return nil }
-func droppedInDefer() error  { return nil }
-func keptInline() error      { return nil }
-func keptInDefer() error     { return nil }
+func plain() error       { return nil }
+func inIf() error        { return nil }
+func inLoop() error      { return nil }
+func inSwitch() error    { return nil }
+func deferredInIf() error { return nil }
+func inClosure() error   { return nil }
+func guardedInClosure() error { return nil }
+func blanked() error     { return nil }
 
-func probe() (err error) {
-	defer func() {
-		if err != nil {
-			droppedInDefer()
-		}
-		keptInDefer()
-	}()
-	if err != nil {
-		droppedInline()
+func probe(err error, ready bool) error {
+	plain()
+	if ready {
+		inIf()
 	}
-	keptInline()
+	for range 2 {
+		inLoop()
+	}
+	switch {
+	case err != nil:
+		inSwitch()
+	}
+	if ready {
+		defer deferredInIf()
+	}
+	defer func() {
+		inClosure()
+		if err != nil {
+			guardedInClosure()
+		}
+	}()
+	_ = blanked()
 	return nil
 }
 `)
-	called := map[string]bool{}
-	for _, call := range onSuccessPath(failingSpans(info, body), callsOf(body)) {
+	judged := map[string]bool{}
+	for _, call := range discardedCloses(body) {
 		if ident, ok := call.Fun.(*ast.Ident); ok {
-			called[ident.Name] = true
+			judged[ident.Name] = true
 		}
 	}
 
-	assert.False(
-		t,
-		called["droppedInline"],
-		"a discard inside `if err != nil` is cleanup the caller is already being told about",
-	)
-	assert.False(t, called["droppedInDefer"], "the same check inside a deferred closure guards the same cleanup")
-	assert.True(t, called["keptInline"], "a discard on the success path is the last word on the file")
-	assert.True(t, called["keptInDefer"], "and so is one in a deferred closure that runs unguarded")
+	assert.True(t, judged["plain"], "a bare call at the top of the body is unconditional")
+	assert.True(t, judged["blanked"], "so is a wholly blank assignment there")
+	assert.False(t, judged["inIf"], "a discard inside an if is not judged")
+	assert.False(t, judged["inLoop"], "nor one inside a loop")
+	assert.False(t, judged["inSwitch"], "nor one inside a switch case")
+	assert.True(t, judged["deferredInIf"], "a DEFER is judged wherever it sits, so a branch cannot silence it")
+	assert.True(t, judged["inClosure"], "a deferred closure's own top-level statement is unconditional")
+	assert.False(t, judged["guardedInClosure"], "one guarded inside that closure is the rollback idiom")
+}
+
+// typedBody parses one snippet, type-checks it, and yields the checker's info
+// with the body of its `probe` function — so a helper can be driven on nodes
+// the checker actually produced rather than on a hand-built approximation of
+// them, which is how an earlier guard test came to be satisfied by the walk
+// falling short instead of by the guard.
+func typedBody(t *testing.T, source probeSource) (*types.Info, *ast.BlockStmt) {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "probe.go", string(source), 0)
+	require.NoError(t, err)
+
+	info := &types.Info{
+		Types: map[ast.Expr]types.TypeAndValue{},
+		Defs:  map[*ast.Ident]types.Object{},
+		Uses:  map[*ast.Ident]types.Object{},
+	}
+	_, err = (&types.Config{}).Check("probe", fset, []*ast.File{file}, info)
+	require.NoError(t, err)
+
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if ok && fn.Name.Name == "probe" {
+			return info, fn.Body
+		}
+	}
+	require.FailNow(t, "the snippet declares no probe function")
+	return nil, nil
+}
+
+// probeSource is the Go source of one type-checkable snippet.
+type probeSource string
+
+// callsOf yields the call expressions of a body in source order.
+func callsOf(body *ast.BlockStmt) []*ast.CallExpr {
+	var found []*ast.CallExpr
+	ast.Inspect(body, func(node ast.Node) bool {
+		if call, ok := node.(*ast.CallExpr); ok {
+			found = append(found, call)
+		}
+		return true
+	})
+	return found
+}
+
+// TestUnconditionalDiscardsStopsAtOneBlock names the invariant
+// unconditionalDiscards documents: it applies its collector to the statements
+// of ONE block and never descends, which is what keeps a discard reached
+// through a branch, a loop or a label out of the judged set without the
+// analyzer having to decide anything about that branch.
+func TestUnconditionalDiscardsStopsAtOneBlock(t *testing.T) {
+	t.Parallel()
+
+	top := &ast.ExprStmt{X: &ast.CallExpr{Fun: ast.NewIdent("top")}}
+	nested := &ast.ExprStmt{X: &ast.CallExpr{Fun: ast.NewIdent("nested")}}
+	stmts := []ast.Stmt{top, &ast.IfStmt{Body: &ast.BlockStmt{List: []ast.Stmt{nested}}}}
+
+	collected := unconditionalDiscards(stmts, inlineDiscards)
+
+	require.Len(t, collected, 1, "the nested statement belongs to the branch, not to this block")
+	assert.Same(t, top.X, collected[0])
+	assert.Empty(t, unconditionalDiscards(nil, inlineDiscards), "an empty block discards nothing")
 }

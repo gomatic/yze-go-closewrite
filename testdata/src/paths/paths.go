@@ -1,12 +1,21 @@
 // Package paths exercises the predicate that decides whether a discarded Close
-// is reported: the PATH it sits on, not the keyword it is spelled with. The
-// near-misses here deviate from their positive in exactly one place.
+// is judged: whether the analyzer can see that it is UNCONDITIONAL, not the
+// keyword it is spelled with. The near-misses here deviate from their positive
+// in exactly one place.
+//
+// The silent half is the load-bearing half, and every shape in it was
+// constructed by an adversarial pass against a revision that tried to recognise
+// the failing branch instead. Each is the same cleanup as the first, written a
+// way that revision did not recognise and therefore reported.
 package paths
 
-import "os"
+import (
+	"errors"
+	"os"
+)
 
-// InlineOnSuccess throws the close error away on the success path with a bare
-// call. Nothing is failing, so nothing else will tell the caller.
+// InlineOnSuccess throws the close error away unconditionally with a bare call.
+// Nothing guards it, so nothing else will tell the caller.
 func InlineOnSuccess(path string) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -49,11 +58,10 @@ func DeferredOnSuccess(path string) error {
 	return nil
 }
 
-// CleanupOnFailingPath is the shape the exemption exists for: the file is
-// handed back to the caller on success, so its close is the caller's, and the
-// discard runs only where the write already failed and the caller is about to
-// be told.
-func CleanupOnFailingPath(path, data string) (*os.File, error) {
+// CleanupInsideACheck is the shape the exemption exists for: the file is handed
+// back to the caller on success, so its close is the caller's, and the discard
+// runs only inside the branch that already failed.
+func CleanupInsideACheck(path, data string) (*os.File, error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return nil, err
@@ -65,10 +73,10 @@ func CleanupOnFailingPath(path, data string) (*os.File, error) {
 	return f, nil
 }
 
-// CleanupOnSuccessPath deviates from CleanupOnFailingPath in exactly one place:
-// the discard sits AFTER the check rather than inside it, so it runs when the
-// write succeeded and the close error is the only thing left to report.
-func CleanupOnSuccessPath(path, data string) (*os.File, error) {
+// CleanupOutsideTheCheck deviates from CleanupInsideACheck in exactly one
+// place: the discard sits after the branch rather than inside it, so nothing
+// guards it and the close error is the only thing left to report.
+func CleanupOutsideTheCheck(path, data string) (*os.File, error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return nil, err
@@ -80,93 +88,120 @@ func CleanupOnSuccessPath(path, data string) (*os.File, error) {
 	return f, nil
 }
 
-// NilCheckElseIsTheFailingBranch writes the check the other way round. The ELSE
-// of `if err == nil` is the already-failing path and its discard is silent; the
-// body is the success path and its discard reports.
-func NilCheckElseIsTheFailingBranch(path, data string) (*os.File, error) {
+// CleanupBehindErrorsIs writes the same check with errors.Is. A revision that
+// recognised `err != nil` and nothing else reported this one.
+func CleanupBehindErrorsIs(path, data string) (*os.File, error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return nil, err
 	}
-	if _, werr := f.WriteString(data); werr == nil {
-		f.Close() // want `the Close error on f is discarded`
-		return f, nil
-	} else {
+	if _, werr := f.WriteString(data); errors.Is(werr, os.ErrPermission) {
 		_ = f.Close()
 		return nil, werr
 	}
+	return f, nil
 }
 
-// NilCheckWithoutElse deviates from NilCheckElseIsTheFailingBranch in one
-// place: there is no else, so the check opens no failing span at all.
-func NilCheckWithoutElse(path, data string) (*os.File, error) {
+// CleanupBehindACompoundCondition adds a second disjunct to the check, which is
+// enough to make a syntactic error-check matcher miss it.
+func CleanupBehindACompoundCondition(path, data string) (*os.File, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	if n, werr := f.WriteString(data); werr != nil || n != len(data) {
+		_ = f.Close()
+		return nil, werr
+	}
+	return f, nil
+}
+
+// CleanupInsideASwitch writes the same check as a switch case.
+func CleanupInsideASwitch(path, data string) (*os.File, error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return nil, err
 	}
 	_, werr := f.WriteString(data)
-	if werr == nil {
-		f.Close() // want `the Close error on f is discarded`
-	}
-	return f, werr
-}
-
-// NonErrorConditionOpensNoFailingPath guards the discard behind a condition
-// establishing nothing about an error. A count is not a failure.
-func NonErrorConditionOpensNoFailingPath(path, data string) (*os.File, error) {
-	f, err := os.Create(path)
-	if err != nil {
-		return nil, err
-	}
-	n, werr := f.WriteString(data)
-	if n > 0 {
-		f.Close() // want `the Close error on f is discarded`
-	}
-	return f, werr
-}
-
-// NonComparisonConditionOpensNoFailingPath guards it behind a bare boolean,
-// which is not a comparison at all.
-func NonComparisonConditionOpensNoFailingPath(path string, ready bool) (*os.File, error) {
-	f, err := os.Create(path)
-	if err != nil {
-		return nil, err
-	}
-	if ready {
-		f.Close() // want `the Close error on f is discarded`
+	switch {
+	case werr != nil:
+		_ = f.Close()
+		return nil, werr
 	}
 	return f, nil
 }
 
-// ComparedToSomethingOtherThanNil compares the error against a sentinel rather
-// than against nil, which does not establish that this path is failing.
-func ComparedToSomethingOtherThanNil(path, data string) (*os.File, error) {
+// CleanupBehindAGoto reaches the same cleanup through a label, where there is
+// no condition at the discard at all.
+func CleanupBehindAGoto(path, data string) (*os.File, error) {
 	f, err := os.Create(path)
 	if err != nil {
 		return nil, err
 	}
-	_, werr := f.WriteString(data)
-	if werr != os.ErrClosed {
-		f.Close() // want `the Close error on f is discarded`
+	var werr error
+	if _, werr = f.WriteString(data); werr != nil {
+		goto fail
 	}
-	return f, werr
+	return f, nil
+fail:
+	_ = f.Close()
+	return nil, werr
 }
 
-// NonErrorComparedToNil compares a NON-error against nil: a nil check on
-// something that is not a failure opens no failing path.
-func NonErrorComparedToNil(path string, buf []byte) (*os.File, error) {
+// CleanupBehindACollectedError checks a length rather than an error, which is
+// how a function accumulating failures spells the same thing.
+func CleanupBehindACollectedError(path, data string) (*os.File, []error) {
+	var errs []error
 	f, err := os.Create(path)
 	if err != nil {
-		return nil, err
+		return nil, []error{err}
 	}
-	if buf != nil {
-		f.Close() // want `the Close error on f is discarded`
+	if _, werr := f.WriteString(data); werr != nil {
+		errs = append(errs, werr)
+	}
+	if len(errs) > 0 {
+		_ = f.Close()
+		return nil, errs
 	}
 	return f, nil
 }
 
-// TupleDiscardOnSuccess throws two closes away in one all-blank tuple
-// assignment on the success path: both are members of the blank-assign family.
+// CleanupInsideALoop closes inside a loop body, where whether the iteration is
+// the failing one is not a property of the statement.
+func CleanupInsideALoop(paths []string) error {
+	f, err := os.Create(paths[0])
+	if err != nil {
+		return err
+	}
+	for range paths {
+		f.Close()
+	}
+	return nil
+}
+
+// alwaysFailing is never nil, which is what makes the next function a forgery
+// rather than a cleanup.
+var alwaysFailing = errors.New("always")
+
+// ForgedErrorCheckDoesNotSilence wraps an ordinary deferred close in a check
+// that is always taken, over an error that is unrelated, never nil and never
+// propagated. A revision that exempted the body of an error check silenced this
+// — two lines, no change in behaviour, a disablement the rule invented — so a
+// DEFER is judged wherever it sits.
+func ForgedErrorCheckDoesNotSilence(path, data string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if alwaysFailing != nil {
+		defer f.Close() // want `the Close error on f is discarded`
+	}
+	_, err = f.WriteString(data)
+	return err
+}
+
+// TupleDiscardOnSuccess throws two closes away in one unconditional all-blank
+// tuple assignment: both are members of the blank-assign family.
 func TupleDiscardOnSuccess(p, q string) error {
 	f, err := os.Create(p)
 	if err != nil {
@@ -206,11 +241,10 @@ func ReaderInlineDiscardIsSilent(path string) error {
 	return nil
 }
 
-// RollbackCloseInsideADeferIsSilent is the rollback idiom: the deferred closure
-// closes only when the NAMED RESULT carries a failure, which is the same
-// cleanup as CleanupOnFailingPath written in the one place it can run. The
-// closure runs on every path; its guarded body does not.
-func RollbackCloseInsideADeferIsSilent(path, data string) (f *os.File, err error) {
+// RollbackInsideADeferIsSilent is the rollback idiom: the deferred closure
+// closes only under a guard, which is cleanup on the failing path written in
+// the one place it can run.
+func RollbackInsideADeferIsSilent(path, data string) (f *os.File, err error) {
 	f, err = os.Create(path)
 	if err != nil {
 		return nil, err
@@ -226,11 +260,10 @@ func RollbackCloseInsideADeferIsSilent(path, data string) (f *os.File, err error
 	return f, nil
 }
 
-// RollbackCloseWithoutTheCheck deviates from RollbackCloseInsideADeferIsSilent
-// in exactly one place: the deferred closure closes unconditionally. It
-// therefore runs on the success path too, where the close error is the last
-// word on the file.
-func RollbackCloseWithoutTheCheck(path, data string) (f *os.File, err error) {
+// RollbackWithoutTheGuard deviates from RollbackInsideADeferIsSilent in exactly
+// one place: the deferred closure closes unconditionally, so it runs on every
+// path and the close error is the last word on the file.
+func RollbackWithoutTheGuard(path, data string) (f *os.File, err error) {
 	f, err = os.Create(path)
 	if err != nil {
 		return nil, err
@@ -242,4 +275,39 @@ func RollbackCloseWithoutTheCheck(path, data string) (f *os.File, err error) {
 		return nil, err
 	}
 	return f, nil
+}
+
+// RollbackThroughAHelperClosureIsSilent puts the guarded close one closure
+// deeper. A literal is its own function, so nothing in it belongs to the
+// deferred closure's own statements.
+func RollbackThroughAHelperClosureIsSilent(path, data string) (f *os.File, err error) {
+	f, err = os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		cleanup := func() {
+			if err != nil {
+				f.Close()
+			}
+		}
+		cleanup()
+	}()
+	if _, err = f.WriteString(data); err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+// DeferredReturnedCloseIsDiscarded pins the return shape inside a deferred
+// closure: the defer runtime throws the value away, so returning the close is
+// discarding it.
+func DeferredReturnedCloseIsDiscarded(path, data string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer func() error { return f.Close() }() // want `the Close error on f is discarded`
+	_, err = f.WriteString(data)
+	return err
 }

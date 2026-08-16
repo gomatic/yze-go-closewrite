@@ -111,43 +111,53 @@ func pointerOnlyError() *types.Named {
 	return named
 }
 
-// TestSeamedCloseAcceptsOnlyACallShapedLikeFClose names the invariant
-// seamedClose documents: nothing wider than f.Close()'s own shape settles a
-// file. A second argument means the call was never closing on this function's
-// behalf, a second result means it was asked about something else, and an
-// argument that is not a name hands it no file at all.
-func TestSeamedCloseAcceptsOnlyACallShapedLikeFClose(t *testing.T) {
+// TestSeamedCloseTurnsOnTheRESULTAndNotTheArgumentList names the invariant
+// seamedClose documents: a lone error result is what a close hands back, and a
+// second result is what separates io.Copy or a Write from a close. The argument
+// list decides nothing but WHICH files were handed over — an earlier revision
+// required the file to be the only argument and reported
+// `closeLogged(logger, f)`, a finding no author can act on.
+func TestSeamedCloseTurnsOnTheRESULTAndNotTheArgumentList(t *testing.T) {
 	t.Parallel()
 
 	info, body := typedBody(t, `package probe
 
 type carrier struct{}
 
-func closeIt(c *carrier) error            { return nil }
-func writeTo(c *carrier, b []byte) error  { return nil }
-func describe(c *carrier) (string, error) { return "", nil }
-func refuse(msg string) error             { return nil }
+func closeIt(c *carrier) error              { return nil }
+func closeLogged(tag string, c *carrier) error { return nil }
+func flushAndClose(c *carrier) (int64, error)  { return 0, nil }
+func refuse(msg string) error               { return nil }
+func closeBoth(a, b *carrier) error         { return nil }
 
-func probe(c *carrier, b []byte) {
+func probe(c, d *carrier, tag string) {
 	_ = closeIt(c)
-	_ = writeTo(c, b)
-	_, _ = describe(c)
+	_ = closeLogged(tag, c)
+	_, _ = flushAndClose(c)
 	_ = refuse("no file here")
+	_ = closeBoth(c, d)
 }
 `)
 	calls := callsOf(body)
-	require.Len(t, calls, 4)
+	require.Len(t, calls, 5)
 
-	settled, ok := seamedClose(info, calls[0])
-	assert.True(t, ok, "one argument, the file, and one error result is the seam")
-	assert.Equal(t, "c", settled.Name())
+	names := func(call *ast.CallExpr) []string {
+		got := make([]string, 0, len(call.Args))
+		for _, object := range seamedClose(info, call) {
+			got = append(got, object.Name())
+		}
+		return got
+	}
 
-	_, ok = seamedClose(info, calls[1])
-	assert.False(t, ok, "a second argument means the call was not closing the file")
-
-	_, ok = seamedClose(info, calls[2])
-	assert.False(t, ok, "a second result means the call was asked about something else")
-
-	_, ok = seamedClose(info, calls[3])
-	assert.False(t, ok, "an argument that is not a name hands over no file")
+	assert.Equal(t, []string{"c"}, names(calls[0]), "one argument, one error result, is the seam")
+	assert.Equal(
+		t,
+		[]string{"tag", "c"},
+		names(calls[1]),
+		"every name handed over is returned and the caller keeps only the opened files; a second argument changes nothing, because the result is still nothing but an error",
+	)
+	assert.Empty(t, names(calls[2]), "a second result means the call was asked about something besides the close")
+	assert.Empty(t, names(calls[3]), "an argument that is not a name hands over no file")
+	assert.Equal(t, []string{"c", "d"}, names(calls[4]),
+		"one call taking two files settles both, which no signature can tell from a helper that closes both")
 }

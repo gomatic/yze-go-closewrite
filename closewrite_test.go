@@ -40,27 +40,31 @@ func TestRegistrationIsWellFormed(t *testing.T) {
 }
 
 // TestOnlyASeamSettlesAFile pins the settlement rule in both directions. A file
-// is settled only by a bound Close or by a call with the shape of one — a
-// single argument, the file, and a single error result — so the safety-net
-// pair, the return-bound close, the errors.Join'd close and the two seams stay
-// silent, while everything wider still reports: an unbound write through fmt, a
-// BOUND write through fmt, io.Copy into the file, a call with a second result,
-// a one-argument call handed a literal instead of the file, a bufio wrapper, a
-// result whose POINTER is the error, a result-less call, and the two discards.
+// is settled only by a bound Close or by a call handed the file whose result is
+// an error and nothing else, so the safety-net pair, the return-bound close,
+// the errors.Join'd close, the seams, a seam taking a second argument and a
+// parenthesised one all stay silent — as do the two shapes the rule declares it
+// cannot separate from a close, a one-argument write and a call handed two
+// files. Everything with a second RESULT still reports: an unbound write
+// through fmt, a BOUND write through fmt, io.Copy into the file, a call
+// returning a name beside its error, a bufio wrapper, a result whose POINTER is
+// the error, a result-less call, and the two discards.
 func TestOnlyASeamSettlesAFile(t *testing.T) {
 	t.Parallel()
 
 	analysistest.Run(t, analysistest.TestData(), closewrite.Analyzer, "bound")
 }
 
-// TestTheFailingPathIsWhatExemptsADiscard pins the predicate the rule turns on.
-// Every spelling of a discard on the success path reports — bare call, blank
-// assignment, blank tuple, defer — and only a discard reached with a failure
-// already in hand is silent, whether that is the body of `if err != nil` or the
-// else of `if err == nil`. The near-misses each deviate in one place: a
-// condition comparing a non-error to nil, an error to a sentinel, a count, a
-// bare boolean, and a nil check with no else at all.
-func TestTheFailingPathIsWhatExemptsADiscard(t *testing.T) {
+// TestOnlyAnUnconditionalDiscardIsJudged pins the predicate the rule turns on.
+// Every spelling of an unconditional discard reports — bare call, blank
+// assignment, blank tuple, defer, and a deferred closure's own statements —
+// while a discard reached only through a branch is silent whatever the branch
+// is. The silent half carries the shapes an adversarial pass wrote against a
+// revision that tried to recognise the failing check instead: errors.Is, a
+// compound condition, a switch case, a goto label, a length test and a loop.
+// Beside them sits the forgery that revision could not refuse — an always-taken
+// check over an unrelated error — which reports.
+func TestOnlyAnUnconditionalDiscardIsJudged(t *testing.T) {
 	t.Parallel()
 
 	analysistest.Run(t, analysistest.TestData(), closewrite.Analyzer, "paths")
