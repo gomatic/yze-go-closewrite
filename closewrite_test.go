@@ -39,22 +39,41 @@ func TestRegistrationIsWellFormed(t *testing.T) {
 	assert.Same(t, closewrite.Analyzer, closewrite.Registration.Analyzer)
 }
 
-// TestOnlyABoundCallSettlesAFile pins the binding rule the settlement rests
-// on, in both directions: writing through fmt, handing the file to a
-// result-less call, wrapping it in bufio, discarding the close twice, and the
-// var-declaration open all still report — while the safety-net pair, the
-// return-bound close, the errors.Join'd close, the seamed close, and the
-// documented bound-write heuristic stay silent.
-func TestOnlyABoundCallSettlesAFile(t *testing.T) {
+// TestOnlyASeamSettlesAFile pins the settlement rule in both directions. A file
+// is settled only by a bound Close or by a call with the shape of one — a
+// single argument, the file, and a single error result — so the safety-net
+// pair, the return-bound close, the errors.Join'd close and the two seams stay
+// silent, while everything wider still reports: an unbound write through fmt, a
+// BOUND write through fmt, io.Copy into the file, a call with a second result,
+// a one-argument call handed a literal instead of the file, a bufio wrapper, a
+// result whose POINTER is the error, a result-less call, and the two discards.
+func TestOnlyASeamSettlesAFile(t *testing.T) {
 	t.Parallel()
 
 	analysistest.Run(t, analysistest.TestData(), closewrite.Analyzer, "bound")
 }
 
+// TestTheFailingPathIsWhatExemptsADiscard pins the predicate the rule turns on.
+// Every spelling of a discard on the success path reports — bare call, blank
+// assignment, blank tuple, defer — and only a discard reached with a failure
+// already in hand is silent, whether that is the body of `if err != nil` or the
+// else of `if err == nil`. The near-misses each deviate in one place: a
+// condition comparing a non-error to nil, an error to a sentinel, a count, a
+// bare boolean, and a nil check with no else at all.
+func TestTheFailingPathIsWhatExemptsADiscard(t *testing.T) {
+	t.Parallel()
+
+	analysistest.Run(t, analysistest.TestData(), closewrite.Analyzer, "paths")
+}
+
 // TestEveryWriteFlagSpellingIsRecognised pins flag resolution beyond the
-// literal selector: a folded named constant, a local flag variable, and each
-// write flag alone — O_WRONLY, O_RDWR, O_APPEND, O_TRUNC, and the documented
-// O_CREATE decision — while the read-only open stays silent.
+// literal selector: a folded named constant, a local flag variable, a
+// parenthesised one, os.CreateTemp, and each write flag alone — O_WRONLY,
+// O_RDWR, O_APPEND, O_TRUNC, and the documented O_CREATE decision. Silent
+// beside them: the read-only open, the read-only open carrying a permission
+// that collides with the write mask on either platform, a flag arriving as a
+// parameter, and a flag bound at index 1 of a tuple — the last two being the
+// documented limits of the chase, and the position it must not index past.
 func TestEveryWriteFlagSpellingIsRecognised(t *testing.T) {
 	t.Parallel()
 

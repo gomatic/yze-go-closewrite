@@ -14,24 +14,27 @@ func DeferredCreate(path string) error {
 	return err
 }
 
-// BlankAssigned closes inline on a path already returning: cleanup, not loss.
+// BlankAssigned discards the close on the SUCCESS path: `return err` hands back
+// the WRITE error, which is nil exactly when the close error was the only thing
+// left to report, so the blank assignment loses it.
 func BlankAssigned(path string) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	_, err = f.WriteString("data")
-	_ = f.Close()
+	_ = f.Close() // want `the Close error on f is discarded`
 	return err
 }
 
-// BareCall closes inline; nothing deferred runs on the success path.
+// BareCall closes inline on the success path and returns nil over it: the same
+// loss as the deferred form, one token cheaper.
 func BareCall(path string) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o644)
 	if err != nil {
 		return err
 	}
-	f.Close()
+	f.Close() // want `the Close error on f is discarded`
 	return nil
 }
 

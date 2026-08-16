@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 )
 
@@ -118,19 +119,124 @@ func SeamedClose(path, data string) error {
 // closeOutput is the seam a test replaces to force the close failure.
 var closeOutput = func(f *os.File) error { return f.Close() }
 
-// BoundWrite pins the documented heuristic silence: a bound write taking the
-// file settles it even though a checked write is not a handled close. The
-// trade is deliberate — see closedWithHandling — and this fixture keeps it a
-// choice rather than drift.
+// BoundWrite pins that a checked WRITE settles nothing. It differs from
+// FprintWrite above in exactly one place — the write's error is bound — and
+// that is not a fact about the close: whether the bytes reached the disk is
+// decided at Close, which this function still throws away.
 func BoundWrite(path, data string) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer f.Close() // want `the Close error on f is discarded`
 	if _, err := fmt.Fprintln(f, data); err != nil {
 		return err
 	}
+	return nil
+}
+
+// CopiedInto is the analyzer's canonical target written the commonest way there
+// is. io.Copy takes the file and returns an error, and settles nothing: it is a
+// write, and a second argument means it was never closing on this function's
+// behalf.
+func CopiedInto(path string, src io.Reader) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close() // want `the Close error on f is discarded`
+	if _, err := io.Copy(f, src); err != nil {
+		return err
+	}
+	return nil
+}
+
+// describe takes the file and reports something that is not its close.
+func describe(f *os.File) (string, error) { return f.Name(), nil }
+
+// transfer takes the file FIRST and something else second, and returns an
+// error: the shape a seam test keyed on the argument's position would accept.
+func transfer(dst *os.File, src io.Reader) error { _, err := io.Copy(dst, src); return err }
+
+// TwoArgumentCallIsNotASeam deviates from SeamedClose in exactly one place: the
+// bound error-returning call takes a second argument. It was never closing on
+// this function's behalf.
+func TwoArgumentCallIsNotASeam(path string, src io.Reader) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close() // want `the Close error on f is discarded`
+	return transfer(f, src)
+}
+
+// OneCallCannotSettleTwoFiles hands two created files to a single
+// error-returning call that closes neither of them.
+func OneCallCannotSettleTwoFiles(p, q string) error {
+	f, err := os.Create(p)
+	if err != nil {
+		return err
+	}
+	defer f.Close() // want `the Close error on f is discarded`
+	g, err := os.Open(q)
+	if err != nil {
+		return err
+	}
+	defer g.Close()
+	return transfer(f, g)
+}
+
+// TupleResultSeam pins the second half of the seam shape: one argument, but a
+// second RESULT, so the call was asked for something besides the close.
+func TupleResultSeam(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close() // want `the Close error on f is discarded`
+	if _, err := describe(f); err != nil {
+		return err
+	}
+	return nil
+}
+
+// LiteralArgumentSeam binds a one-argument error-returning call whose argument
+// is not a name: no file was handed to it, so it settles nothing.
+func LiteralArgumentSeam(path string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close() // want `the Close error on f is discarded`
+	if failure := errors.New("boom"); failure != nil {
+		return failure
+	}
+	return nil
+}
+
+// verdict is a plain struct: only *verdict implements error, so a verdict VALUE
+// is not assignable to error and errors.Is cannot be called on it.
+type verdict struct{ msg string }
+
+// Error makes the POINTER an error, and the value not one.
+func (v *verdict) Error() string { return v.msg }
+
+// inspect returns a verdict by value and closes nothing.
+func inspect(f *os.File) verdict { return verdict{msg: f.Name()} }
+
+// PointerOnlyErrorSeam pins that a result whose POINTER implements error is not
+// an error: the caller holds a value carrying nothing about the close.
+func PointerOnlyErrorSeam(path, data string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close() // want `the Close error on f is discarded`
+	if _, err := f.WriteString(data); err != nil {
+		return err
+	}
+	result := inspect(f)
+	_ = result
 	return nil
 }
 

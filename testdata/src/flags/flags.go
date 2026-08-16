@@ -129,6 +129,134 @@ func ComputedMode(path string, extra int) error {
 	return err
 }
 
+// PermissionIsNotAFlag opens READ-ONLY with a permission whose bits collide
+// with the write-flag mask on darwin. Write intent is read from the flag
+// argument and from nothing else, so this is silent — and it is silent on every
+// platform, which is the point: judging the permission made the verdict a
+// function of the machine the gate ran on.
+func PermissionIsNotAFlag(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY, 0o666)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	buf := make([]byte, 16)
+	n, _ := f.Read(buf)
+	return buf[:n], nil
+}
+
+// PermissionCollidingOnLinuxOnly is PermissionIsNotAFlag with the permission
+// changed in one place, to the value that collides with the mask on linux
+// rather than on darwin. One source, one verdict, both platforms.
+func PermissionCollidingOnLinuxOnly(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY, 0o700)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	buf := make([]byte, 16)
+	n, _ := f.Read(buf)
+	return buf[:n], nil
+}
+
+// PermissionOnAWriteOpen deviates from PermissionIsNotAFlag in exactly one
+// place: the FLAG carries a write bit. The colliding permission is unchanged,
+// so what reports here is the flag and nothing else.
+func PermissionOnAWriteOpen(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0o666)
+	if err != nil {
+		return err
+	}
+	defer f.Close() // want `the Close error on f is discarded`
+	_, err = f.WriteString("data")
+	return err
+}
+
+// UnresolvedFlagIsSilent takes its flag from a parameter, which resolves to
+// nothing. The documented scope limitation, pinned: the permission beside it
+// carries write bits and does not stand in as evidence.
+func UnresolvedFlagIsSilent(path string, flag int) error {
+	f, err := os.OpenFile(path, flag, 0o666)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return nil
+}
+
+// ParenthesisedFlag wraps the flag variable in parentheses, which the chase
+// unwraps before resolving the name.
+func ParenthesisedFlag(path string) error {
+	flags := os.O_WRONLY | os.O_CREATE
+	f, err := os.OpenFile(path, (flags), 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close() // want `the Close error on f is discarded`
+	_, err = f.WriteString("data")
+	return err
+}
+
+// parseMode returns a name and a flag set, so a caller binds the flag at index
+// 1 of a tuple whose right-hand side is a single call.
+func parseMode(spec string) (string, int) { return spec, os.O_WRONLY | os.O_CREATE }
+
+// TupleBoundFlagIsSilent binds the flag at a position the chase must not index
+// into a shorter right-hand side. The flag resolves to nothing — a call's
+// second result is beyond one level of assignment — so the open is silent, and
+// the chase must reach that silence rather than panic on the way.
+func TupleBoundFlagIsSilent(spec, path string) error {
+	_, flags := parseMode(spec)
+	f, err := os.OpenFile(path, flags, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString("data")
+	return err
+}
+
+// TupleDeclaredFlagIsSilent is the var-declaration twin of the same binding,
+// and the same index.
+func TupleDeclaredFlagIsSilent(spec, path string) error {
+	var _, flags = parseMode(spec)
+	f, err := os.OpenFile(path, flags, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString("data")
+	return err
+}
+
+// openSpec yields all three of os.OpenFile's arguments at once.
+func openSpec(path string) (string, int, os.FileMode) { return path, os.O_WRONLY, 0o644 }
+
+// TupleSpreadOpenIsSilent passes the whole argument list through as one call's
+// results. There is no separate flag argument to read, so nothing resolves and
+// the open is silent — the alternative being to read the ONE argument as a flag,
+// which is how the permission came to be judged as one.
+func TupleSpreadOpenIsSilent(path string) error {
+	f, err := os.OpenFile(openSpec(path))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString("data")
+	return err
+}
+
+// TempFile pins os.CreateTemp, the third write opener the package doc names.
+func TempFile(dir, pattern string) error {
+	f, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return err
+	}
+	defer f.Close() // want `the Close error on f is discarded`
+	_, err = f.WriteString("data")
+	return err
+}
+
 // ReassignedAfterOpen pins the flow rule: what the flag variable becomes AFTER
 // the open opened nothing. The reader below was opened read-only and stays
 // silent although the same variable later carries a write flag.

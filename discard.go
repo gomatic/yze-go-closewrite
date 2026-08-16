@@ -1,33 +1,98 @@
 package closewrite
 
-import "go/ast"
+import (
+	"go/ast"
+	"go/types"
+)
 
-// discardedCloses collects the DEFERRED Close calls in body whose error goes
-// nowhere.
+// discardedCloses collects the Close calls in body whose error goes nowhere on
+// a path that is not ALREADY FAILING.
 //
-// Deferred is the whole point, and it is what keeps this rule quiet. A
-// deferred close runs on the SUCCESS path, where its discarded error is the
-// only remaining signal that the file is bad — that is the defect. An inline
-// `_ = f.Close()` sitting just before `return nil, err` is the opposite: a
-// deliberate cleanup on a path that is already failing for a reason the caller
-// is about to be told. Nothing was written, nothing is lost, and reporting it
-// buries the real findings. Measured across 186 modules, that single
-// distinction accounted for four of the six false positives.
+// The path is what discriminates, and it is what keeps this rule quiet. A close
+// reached on the success path is the last remaining signal that the file is
+// bad, whether it is spelled `defer f.Close()`, `f.Close()` or
+// `_ = f.Close()` — all three throw the same error away and lose the same data.
+// An `_ = f.Close()` sitting inside `if err != nil { … return err }` is the
+// opposite: a deliberate cleanup on a path already failing for a reason the
+// caller is about to be told, where reporting it would bury the real findings.
+// Measured across 186 modules, that single distinction accounted for four of
+// the six false positives.
 //
-// Two shapes discard the error, and they are the only two: `defer f.Close()`,
-// and `defer func() { _ = f.Close() }()`. The named-return closure
-// `defer func() { err = f.Close() }()` binds the error and is silent here —
+// An earlier revision discriminated on the `defer` keyword instead, which is
+// not the same predicate: it left `f.Close(); return nil` — the identical loss,
+// one token cheaper than the honest remedy — entirely silent, so evading the
+// rule cost less than complying with it.
+//
+// Inside a deferred closure a `return` reaches nobody, so the discarding shapes
+// there are wider: `defer f.Close()`, and any statement of
+// `defer func() { … }()` that throws a call away. The named-return closure
+// `defer func() { err = f.Close() }()` binds the error and is silent —
 // recognising it matters more than it looks, because it is the correct way to
 // return a Close error from a defer, and a rule that flagged it would push
 // authors away from the very fix it is asking for.
-func discardedCloses(body *ast.BlockStmt) []*ast.CallExpr {
+func discardedCloses(info *types.Info, body *ast.BlockStmt) []*ast.CallExpr {
 	var discarded []*ast.CallExpr
-	walkOwn(body, func(node ast.Node, _ deferredness) {
+	walkOwn(body, func(node ast.Node, isDeferred deferredness) {
 		if deferred, ok := node.(*ast.DeferStmt); ok {
 			discarded = append(discarded, deferredDiscards(deferred)...)
+			return
+		}
+		if isDeferred == ownFlow {
+			discarded = append(discarded, inlineDiscards(node)...)
 		}
 	})
-	return discarded
+	return onSuccessPath(failingSpans(info, body), discarded)
+}
+
+// onSuccessPath keeps the discards that are NOT reached with a failure already
+// in hand, wherever they sit.
+//
+// Applying this to a deferred closure's discards as well as to the ordinary
+// ones is the whole reason it is a separate pass. The rollback idiom —
+// `defer func() { if err != nil { f.Close(); os.Remove(f.Name()) } }()` over a
+// named result — is exactly the cleanup this exemption exists for, written in
+// the one place it can run, and an earlier draft of this file declared the
+// opposite in a comment: that a deferred closure has no failing branch because
+// it runs on every path. The closure runs on every path; its `if err != nil`
+// body does not. That comment was a limitation blessed rather than a property,
+// and it was found by adjudicating a finding this rule newly reported against
+// internal/fuzz in the standard library.
+func onSuccessPath(failing failing, calls []*ast.CallExpr) []*ast.CallExpr {
+	var kept []*ast.CallExpr
+	for _, call := range calls {
+		if !failing.covers(call.Pos()) {
+			kept = append(kept, call)
+		}
+	}
+	return kept
+}
+
+// inlineDiscards yields the calls one ordinary statement throws away: a bare
+// call statement, and an assignment whose targets are all blank. A `return` is
+// not one here — outside a deferred closure it reaches the caller.
+func inlineDiscards(node ast.Node) []*ast.CallExpr {
+	assign, ok := node.(*ast.AssignStmt)
+	if !ok {
+		if call, discards := bareCall(node); discards {
+			return []*ast.CallExpr{call}
+		}
+		return nil
+	}
+	if call, discards := blankAssigned(assign); discards {
+		return []*ast.CallExpr{call}
+	}
+	return blankAssignedAll(assign)
+}
+
+// bareCall yields a statement's call when the statement is nothing but that
+// call, so its results go nowhere at all.
+func bareCall(node ast.Node) (*ast.CallExpr, bool) {
+	stmt, ok := node.(*ast.ExprStmt)
+	if !ok {
+		return nil, false
+	}
+	call, ok := stmt.X.(*ast.CallExpr)
+	return call, ok
 }
 
 // deferredDiscards yields the calls a deferred statement throws away: the
@@ -55,15 +120,12 @@ func deferredDiscards(deferred *ast.DeferStmt) []*ast.CallExpr {
 // closure, whose return value the defer runtime throws away.
 func discardedIn(node ast.Node) (*ast.CallExpr, bool) {
 	switch stmt := node.(type) {
-	case *ast.ExprStmt:
-		call, ok := stmt.X.(*ast.CallExpr)
-		return call, ok
 	case *ast.AssignStmt:
 		return blankAssigned(stmt)
 	case *ast.ReturnStmt:
 		return returnedCall(stmt)
 	}
-	return nil, false
+	return bareCall(node)
 }
 
 // returnedCall yields a return statement's single call result, if that is

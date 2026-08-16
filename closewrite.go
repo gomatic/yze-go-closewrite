@@ -10,10 +10,58 @@
 //
 // The rule is deliberately narrow, because a gate that cries wolf is worse
 // than no gate. It fires only where the file's own creation proves the intent
-// to write: os.Create, os.CreateTemp, or os.OpenFile with a write flag. A
-// reader's Close is never reported — nothing is lost by failing to close a
-// file you only read — which keeps the overwhelmingly common `defer f.Close()`
-// after os.Open silent, exactly as it should be.
+// to write: os.Create, os.CreateTemp, or os.OpenFile whose FLAG argument
+// carries O_WRONLY, O_RDWR, O_CREATE, O_APPEND or O_TRUNC. The permission
+// argument is never read as a flag: it is a mode bitmask that collides with the
+// flag values, so reading it reported read-only opens, and reported them
+// differently on darwin and on linux.
+//
+// # What is discarded, and where
+//
+// A Close whose error goes nowhere is reported wherever it sits on a path that
+// is not already failing — `defer f.Close()`, `f.Close()` and `_ = f.Close()`
+// throw away the same error and lose the same data, so the rule cannot turn on
+// the `defer` keyword without making evasion one token cheaper than compliance.
+// The remedy in every spelling is to bind the error: return it, assign it, or
+// take it out of a deferred closure with `defer func() { err = f.Close() }()`.
+//
+// # Every exemption
+//
+// Each of these silences a Close that the clauses above would otherwise report.
+// They are the complete set; anything else that goes unreported is a defect.
+//
+//  1. A reader's Close. Nothing is lost by failing to close a file you only
+//     read, which keeps the overwhelmingly common `defer f.Close()` after
+//     os.Open silent, exactly as it should be.
+//  2. A discard on an ALREADY-FAILING path — a Close inside `if err != nil { … }`
+//     or inside the else of `if err == nil { … }`. The caller is about to be
+//     told about a failure that is not this one, and reporting it buries the
+//     real findings.
+//  3. A close already handled elsewhere in the same body: a bound `f.Close()`,
+//     or a bound SEAM — a call taking the file as its only argument and
+//     returning nothing but an error, which is what `return closeOutput(file)`
+//     looks like and is the sanctioned repair for this rule. Nothing wider
+//     settles anything; in particular a checked WRITE taking the file does not,
+//     because whether the bytes reached the disk is decided at Close.
+//
+// # Every scope limitation
+//
+// These are not exemptions — nothing here was judged and forgiven. They are
+// shapes the analyzer cannot see, and each is a silence a reader should not
+// mistake for approval.
+//
+//  1. One function body. A file handed to another function is that function's
+//     responsibility, and widening this would mean guessing about ownership.
+//  2. Plain identifiers on both sides. A file held in a field —
+//     `h.f, err = os.Create(p)` with `defer h.f.Close()` — is neither opened
+//     nor closed as far as this rule can tell.
+//  3. Flag resolution reaches a literal `os.O_*` selector, a constant the
+//     checker folded, and one level of assignment to a local variable in the
+//     same body. A flag arriving as a parameter, bound from a call's second
+//     result, or spread from a call supplying the whole argument list, resolves
+//     to nothing and the open is silent.
+//  4. Test files are judged like any other source: this analyzer declares no
+//     test scope and the yze runner does not list it as source-only.
 package closewrite
 
 import (
@@ -105,7 +153,7 @@ func reportBody(pass *analysis.Pass, body *ast.BlockStmt) {
 		return
 	}
 	settled := closedWithHandling(pass.TypesInfo, body)
-	for _, call := range discardedCloses(body) {
+	for _, call := range discardedCloses(pass.TypesInfo, body) {
 		name, ok := closedObject(pass.TypesInfo, call)
 		if ok && written[name] && !settled[name] {
 			pass.Reportf(call.Pos(), message, name.Name())
@@ -117,76 +165,80 @@ func reportBody(pass *analysis.Pass, body *ast.BlockStmt) {
 // somewhere in the body, so a second, deferred close of the same file is not a
 // defect.
 //
-// Two shapes settle a file, and both require the call's result to be BOUND.
-// The direct one is a Close call whose error is assigned or returned. The
-// other is the file being HANDED to a bound call — which is what a seamed
-// close looks like: `return closeOutput(file)`, a package-level function var
-// standing in for f.Close() so a test can force the failure. That indirection
-// is the sanctioned way to reach this very branch, and an earlier version of
-// this analyzer reported both files whose closes had just been fixed that way.
-//
-// The bound-argument half is a documented heuristic with a known silence: a
-// bound WRITE taking the file — `if _, err := fmt.Fprintln(f, s); err != nil` —
-// also settles it, though a checked write is not a handled close. The trade is
-// deliberate and fixtured (see boundwrite in the testdata): erring toward
-// silence on a shape that demonstrably checks its errors costs less than
-// flagging the seamed-close repair this rule itself asks for.
+// Two shapes settle a file, and both require the call's result to be BOUND. The
+// direct one is a Close call whose error is assigned or returned. The other is
+// a seam — see seamedClose.
 func closedWithHandling(info *types.Info, body *ast.BlockStmt) map[types.Object]bool {
 	settled := map[types.Object]bool{}
 	for _, call := range boundCalls(body) {
 		if name, ok := closedObject(info, call); ok {
 			settled[name] = true
 		}
-		if !resultsIncludeError(info, call) {
-			continue
-		}
-		for _, name := range argumentObjects(info, call) {
+		if name, ok := seamedClose(info, call); ok {
 			settled[name] = true
 		}
 	}
 	return settled
 }
 
-// resultsIncludeError reports whether the call produces an error among its
-// results — the only kind of bound result that could be carrying a close
-// error. A bound `bufio.NewWriter(f)` binds a writer and proves nothing.
-func resultsIncludeError(info *types.Info, call *ast.CallExpr) bool {
-	at := info.TypeOf(call)
+// seamedClose names the file a bound call closes on this function's behalf.
+//
+// The shape is f.Close()'s own, and nothing wider: ONE argument, the file
+// itself, and ONE result, an error. That is what a seam looks like —
+// `return closeOutput(file)`, a package-level function var standing in for
+// f.Close() so a test can force the failure — and it is the sanctioned repair
+// for this very rule, which an earlier version of this analyzer reported.
+//
+// The narrowness is the point, and the reason is this analyzer's own canonical
+// target. An earlier revision settled a file whenever ANY bound
+// error-returning call took it as an argument, and that swallowed the rule:
+// `io.Copy(f, src)` into a created file — the commonest way there is to write
+// one — went silent, while the byte-identical `f.Write(b)` was reported, so the
+// verdict turned on how the write was SPELLED. A checked write is not a handled
+// close: it says the bytes reached the buffer, and whether they reached the
+// disk is decided at Close, which is the failure this rule exists to catch. A
+// call taking a second argument is not closing on your behalf; one returning a
+// second result is telling you about something other than the close.
+func seamedClose(info *types.Info, call *ast.CallExpr) (types.Object, bool) {
+	if len(call.Args) != 1 || !resultIsError(info, call) {
+		return nil, false
+	}
+	ident, ok := call.Args[0].(*ast.Ident)
+	if !ok {
+		return nil, false
+	}
+	object := info.ObjectOf(ident)
+	return object, object != nil
+}
+
+// resultIsError reports a call whose ONE result is an error, which is the
+// contract: a second result means the call was asked for something besides the
+// close, and a bound `bufio.NewWriter(f)` binds a writer and proves nothing.
+//
+// A call with several results has a *types.Tuple type, and a tuple implements
+// no interface, so it is not an error type and needs no separate test. An
+// explicit tuple guard was written here and then removed as inert: with it
+// deleted the whole suite stays green and every corpus verdict is unchanged, so
+// no case could ever discriminate it.
+func resultIsError(info *types.Info, call *ast.CallExpr) bool {
+	return isErrorType(info.TypeOf(call))
+}
+
+// isErrorType reports a type that IS an error: the universe error itself or any
+// type implementing it, since a seam returning *os.PathError carries the close
+// error as surely as one returning error. A call the checker recorded no type
+// for carries nothing.
+//
+// A type whose POINTER implements error is deliberately not one. The caller of
+// such a seam receives a plain value that is not assignable to error and on
+// which errors.Is cannot be called, so nothing about the close was handled —
+// and accepting it silenced a genuine discarded Close on a written file.
+func isErrorType(at types.Type) bool {
 	if at == nil {
 		return false
 	}
-	if tuple, ok := at.(*types.Tuple); ok {
-		for i := range tuple.Len() {
-			if isErrorType(tuple.At(i).Type()) {
-				return true
-			}
-		}
-		return false
-	}
-	return isErrorType(at)
-}
-
-// isErrorType reports a type that carries an error: the universe error itself
-// or any type implementing it, since a seam returning *os.PathError carries
-// the close error as surely as one returning error.
-func isErrorType(at types.Type) bool {
 	errType := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
-	return types.Implements(at, errType) || types.Implements(types.NewPointer(at), errType)
-}
-
-// argumentObjects names the variables passed directly as arguments to a call.
-func argumentObjects(info *types.Info, call *ast.CallExpr) []types.Object {
-	var passed []types.Object
-	for _, arg := range call.Args {
-		ident, ok := arg.(*ast.Ident)
-		if !ok {
-			continue
-		}
-		if object := info.ObjectOf(ident); object != nil {
-			passed = append(passed, object)
-		}
-	}
-	return passed
+	return types.Implements(at, errType)
 }
 
 // closedObject resolves the variable a Close call was made on.

@@ -107,19 +107,33 @@ func osImported(info *types.Info, expr ast.Expr) *types.Package {
 	return info.ObjectOf(ident).(*types.PkgName).Imported()
 }
 
-// hasWriteFlag reports whether any argument carries an os flag that implies
-// writing, in any spelling: a literal `os.O_*` selector, a constant expression
-// the checker folded (`const mode = os.O_WRONLY | os.O_CREATE`), or a local
-// variable whose assignments BEFORE the open carry either — what the variable
-// becomes after the open opened nothing.
+// openFileArity is os.OpenFile's argument count, and flagArgument is the index
+// of its FLAG argument. Both are exact: os.OpenFile is not variadic, so a call
+// spelled with any other count is passing a tuple through
+// (`os.OpenFile(spec())`), where no argument is separately readable.
+const (
+	openFileArity = 3
+	flagArgument  = 1
+)
+
+// hasWriteFlag reports whether os.OpenFile's FLAG argument carries an os flag
+// that implies writing, in any spelling: a literal `os.O_*` selector, a
+// constant expression the checker folded (`const mode = os.O_WRONLY |
+// os.O_CREATE`), or a local variable whose assignments BEFORE the open carry
+// either — what the variable becomes after the open opened nothing.
+//
+// The flag argument, and no other. The PERMISSION argument is a mode bitmask
+// whose values collide with the flag mask on every platform — 0o666, 0o755 and
+// 0o777 share bits with it on darwin, and 0o700 does on linux as well — so
+// judging every argument reported a read-only open as opened for writing, on
+// evidence that was only a file mode, and reported it differently depending on
+// which machine the gate ran on.
 func hasWriteFlag(info *types.Info, body *ast.BlockStmt, osPkg *types.Package, call *ast.CallExpr) bool {
-	mask := writeFlagMask(osPkg)
-	for _, arg := range call.Args {
-		if flagWrites(info, body, mask, arg, call.Pos()) {
-			return true
-		}
+	if len(call.Args) != openFileArity {
+		return false
 	}
-	return false
+	mask := writeFlagMask(osPkg)
+	return flagWrites(info, body, mask, call.Args[flagArgument], call.Pos())
 }
 
 // flagMask is the OR of write-implying open-flag values.
